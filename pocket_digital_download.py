@@ -57,6 +57,20 @@ PATTERNS = {
     'GBRG': BAYER_GBRG,
 }
 
+# White balance gains (R, G, B) keyed by header tint code.
+# Applied to raw Bayer pixels before demosaicking (same stage as the original driver).
+# The exact gain table was not recovered from the driver binary — all values are
+# currently neutral (1.0) placeholders. Calibrate by sampling a known neutral
+# (white wall, grey card) and adjusting until R ≈ G ≈ B on that region.
+TINT_WB = {
+    # Calibrated from tint=15 (observed on all test images) by sampling
+    # white doors under natural daylight in IMG0249. All other codes default
+    # to the same gains until more scenes are available for calibration.
+    15: (1.112, 1.000, 1.147),
+}
+# Default gains for uncalibrated tint codes
+_WB_DEFAULT = (1.112, 1.000, 1.147)
+
 
 def parse_header(raw_data):
     """
@@ -109,6 +123,28 @@ def extract_bayer(raw_data, sensor_width, active_width, active_height):
         src = IMG_START + row * sensor_width
         dst = row * active_width
         out[dst:dst + active_width] = raw_data[src:src + active_width]
+    return bytes(out)
+
+
+def apply_wb(pixels, width, height, gains, pattern='RGGB'):
+    """
+    Apply per-channel white balance gains to raw Bayer pixels.
+
+    gains: (R_gain, G_gain, B_gain) floats — G is typically 1.0 (reference).
+    Applied before demosaicking so interpolation uses colour-corrected values.
+    """
+    tile = PATTERNS[pattern]
+    r_gain, g_gain, b_gain = gains
+    channel_gain = {'R': r_gain, 'G': g_gain, 'B': b_gain}
+    luts = {
+        pos: bytes(min(255, int(v * channel_gain[ch])) for v in range(256))
+        for pos, ch in tile.items()
+    }
+    out = bytearray(len(pixels))
+    for y in range(height):
+        rp = y % 2
+        for x in range(width):
+            out[y * width + x] = luts[(rp, x % 2)][pixels[y * width + x]]
     return bytes(out)
 
 
@@ -262,11 +298,15 @@ def delete_all_pictures(dev):
 
 
 def save_png(png_path, raw_data, width=IMG_W, height=IMG_H,
-             sensor_width=None, pattern='RGGB', stretch=True, saturation=2.0):
+             sensor_width=None, pattern='RGGB', stretch=True,
+             saturation=2.0, tint=None):
     """Debayer and save as PNG."""
     from PIL import ImageEnhance
     sw = sensor_width if sensor_width is not None else width + DARK_COLS
     pixels = extract_bayer(raw_data, sw, width, height)
+    if tint is not None:
+        gains = TINT_WB.get(tint, _WB_DEFAULT)
+        pixels = apply_wb(pixels, width, height, gains, pattern)
     rgb = debayer_bilinear(pixels, width, height, pattern)
     if stretch:
         rgb = global_stretch(rgb)
@@ -302,13 +342,16 @@ def main():
                         help='Disable global histogram stretching')
     parser.add_argument('--saturation', type=float, default=2.0,
                         help='Colour saturation multiplier (default: 2.0)')
+    parser.add_argument('--no-wb', action='store_true',
+                        help='Disable white balance correction')
     args = parser.parse_args()
 
     output_dir = (Path(args.output_dir) if args.output_dir
                   else Path.home() / "Pictures" / "PocketDigital")
     output_dir.mkdir(parents=True, exist_ok=True)
     print(f"Output directory: {output_dir}")
-    print(f"Bayer pattern: {args.pattern}  Stretch: {not args.no_stretch}  Saturation: {args.saturation}x")
+    print(f"Bayer: {args.pattern}  Stretch: {not args.no_stretch}  "
+          f"Saturation: {args.saturation}x  WB: {not args.no_wb}")
 
     try:
         print("Searching for camera...")
@@ -337,17 +380,21 @@ def main():
                 w = meta.get('active_width', IMG_W)
                 h = meta.get('active_height', IMG_H)
                 sw = meta.get('sensor_width', w + DARK_COLS)
+                tint_code = meta.get('tint', 0)
                 if meta:
+                    wb_gains = TINT_WB.get(tint_code, _WB_DEFAULT)
                     print(f"(sensor {meta['sensor_width']}x{meta['sensor_height']} "
                           f"-> {w}x{h} "
-                          f"gamma={meta['gamma_code']} tint={meta['tint']} "
-                          f"gain={2**meta['gain_shift']}x)", end=" ")
+                          f"gamma={meta['gamma_code']} tint={tint_code} "
+                          f"gain={2**meta['gain_shift']}x "
+                          f"wb={wb_gains})", end=" ")
 
                 png_path = output_dir / f"{safe_name}.png"
                 save_png(str(png_path), data, width=w, height=h,
                          sensor_width=sw, pattern=args.pattern,
                          stretch=not args.no_stretch,
-                         saturation=args.saturation)
+                         saturation=args.saturation,
+                         tint=None if args.no_wb else tint_code)
 
                 if args.raw:
                     ppm_path = output_dir / f"{safe_name}.ppm"
