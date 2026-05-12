@@ -7,9 +7,9 @@ Raw image format: 41-byte header followed by Bayer pixel data at stride=sensor_w
 The camera does NOT pre-crop dark reference columns; each row is sensor_width (e.g. 644)
 bytes wide. The active image is the first active_width (e.g. 640) columns of each row.
 
-Bayer pattern: BGGR.
-  Row 0: B G B G ...  (even rows: B at even cols, G at odd cols)
-  Row 1: G R G R ...  (odd rows:  G at even cols, R at odd cols)
+Bayer pattern: RGGB (empirically confirmed — R/B swap vs sensor datasheet BGGR).
+  Row 0: R G R G ...  (even rows: R at even cols, G at odd cols)
+  Row 1: G B G B ...  (odd rows:  G at even cols, B at odd cols)
 """
 
 import usb.core
@@ -41,10 +41,10 @@ DARK_ROWS = 2   # sensor_height - active_height (dark reference rows per frame)
 IMG_W = 640
 IMG_H = 480
 
-# BGGR tile (row_parity, col_parity) -> channel
-# SMaL UltraPocket sensor layout:
-#   Row 0 (even): B G B G ...
-#   Row 1 (odd):  G R G R ...
+# RGGB tile (row_parity, col_parity) -> channel
+# Empirically confirmed for extracted active area:
+#   Row 0 (even): R G R G ...
+#   Row 1 (odd):  G B G B ...
 BAYER_BGGR = {(0, 0): 'B', (0, 1): 'G', (1, 0): 'G', (1, 1): 'R'}
 BAYER_GRBG = {(0, 0): 'G', (0, 1): 'R', (1, 0): 'B', (1, 1): 'G'}
 BAYER_RGGB = {(0, 0): 'R', (0, 1): 'G', (1, 0): 'G', (1, 1): 'B'}
@@ -112,7 +112,7 @@ def extract_bayer(raw_data, sensor_width, active_width, active_height):
     return bytes(out)
 
 
-def debayer_bilinear(pixels, width=IMG_W, height=IMG_H, pattern='BGGR'):
+def debayer_bilinear(pixels, width=IMG_W, height=IMG_H, pattern='RGGB'):
     """
     Bilinear Bayer demosaicking.
 
@@ -172,30 +172,19 @@ def debayer_bilinear(pixels, width=IMG_W, height=IMG_H, pattern='BGGR'):
     return bytes(rgb)
 
 
-def auto_levels(rgb_bytes, width, height, lo_pct=1.0, hi_pct=99.0):
+def global_stretch(rgb_bytes, lo_pct=2.0, hi_pct=98.0):
     """
-    Linear histogram stretch.
+    Global linear histogram stretch across all channels combined.
 
-    Clips to the lo/hi percentile then scales to full 0-255 range.
-    Handles each channel independently so white balance is preserved.
+    Uses a single lo/hi percentile computed over all R+G+B values so channel
+    ratios (and therefore colour) are preserved.
     """
-    import math
-
-    n = width * height
-    result = bytearray(len(rgb_bytes))
-
-    for ch in range(3):
-        vals = sorted(rgb_bytes[ch::3])
-        lo = vals[max(0, int(n * lo_pct / 100))]
-        hi = vals[min(n - 1, int(n * hi_pct / 100))]
-        span = hi - lo
-        if span == 0:
-            span = 1
-        for i in range(n):
-            v = rgb_bytes[i * 3 + ch]
-            result[i * 3 + ch] = min(255, max(0, int((v - lo) * 255 / span)))
-
-    return bytes(result)
+    s = sorted(rgb_bytes)
+    n = len(s)
+    lo = s[int(n * lo_pct / 100)]
+    hi = s[int(n * hi_pct / 100)]
+    span = max(hi - lo, 1)
+    return bytes(min(255, max(0, int((v - lo) * 255 / span))) for v in rgb_bytes)
 
 
 def find_camera():
@@ -273,14 +262,17 @@ def delete_all_pictures(dev):
 
 
 def save_png(png_path, raw_data, width=IMG_W, height=IMG_H,
-             sensor_width=None, pattern='BGGR', stretch=True):
-    """Debayer and save as PNG, optionally with auto-level stretching."""
+             sensor_width=None, pattern='RGGB', stretch=True, saturation=2.0):
+    """Debayer and save as PNG."""
+    from PIL import ImageEnhance
     sw = sensor_width if sensor_width is not None else width + DARK_COLS
     pixels = extract_bayer(raw_data, sw, width, height)
     rgb = debayer_bilinear(pixels, width, height, pattern)
     if stretch:
-        rgb = auto_levels(rgb, width, height)
+        rgb = global_stretch(rgb)
     img = Image.frombytes('RGB', (width, height), rgb)
+    if saturation != 1.0:
+        img = ImageEnhance.Color(img).enhance(saturation)
     img.save(png_path, 'PNG')
     print(f"  Saved: {png_path}")
 
@@ -303,18 +295,20 @@ def main():
                         help='Also save raw Bayer PPM files')
     parser.add_argument('--delete', action='store_true',
                         help='Delete photos from camera after downloading')
-    parser.add_argument('--pattern', default='BGGR',
+    parser.add_argument('--pattern', default='RGGB',
                         choices=list(PATTERNS.keys()),
-                        help='Bayer CFA pattern (default: BGGR)')
+                        help='Bayer CFA pattern (default: RGGB)')
     parser.add_argument('--no-stretch', action='store_true',
-                        help='Disable auto-level histogram stretching')
+                        help='Disable global histogram stretching')
+    parser.add_argument('--saturation', type=float, default=2.0,
+                        help='Colour saturation multiplier (default: 2.0)')
     args = parser.parse_args()
 
     output_dir = (Path(args.output_dir) if args.output_dir
                   else Path.home() / "Pictures" / "PocketDigital")
     output_dir.mkdir(parents=True, exist_ok=True)
     print(f"Output directory: {output_dir}")
-    print(f"Bayer pattern: {args.pattern}  Auto-stretch: {not args.no_stretch}")
+    print(f"Bayer pattern: {args.pattern}  Stretch: {not args.no_stretch}  Saturation: {args.saturation}x")
 
     try:
         print("Searching for camera...")
@@ -352,7 +346,8 @@ def main():
                 png_path = output_dir / f"{safe_name}.png"
                 save_png(str(png_path), data, width=w, height=h,
                          sensor_width=sw, pattern=args.pattern,
-                         stretch=not args.no_stretch)
+                         stretch=not args.no_stretch,
+                         saturation=args.saturation)
 
                 if args.raw:
                     ppm_path = output_dir / f"{safe_name}.ppm"
