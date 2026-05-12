@@ -278,21 +278,13 @@ def main():
     parser.add_argument('output_dir', nargs='?', default=None)
     parser.add_argument('--raw', action='store_true',
                         help='Also save raw Bayer PPM files')
-    parser.add_argument('--delete', action='store_true',
-                        help='Delete photos from camera after downloading')
-    parser.add_argument('--pattern', default='RGGB', choices=list(PATTERNS.keys()),
-                        help='Bayer CFA pattern (default: RGGB)')
-    parser.add_argument('--no-stretch', action='store_true',
-                        help='Disable global histogram stretching')
     parser.add_argument('--saturation', type=float, default=2.0,
                         help='Colour saturation multiplier (default: 2.0)')
     args = parser.parse_args()
 
-    output_dir = (Path(args.output_dir) if args.output_dir
-                  else Path.home() / "Pictures" / "PocketDigital")
+    output_dir = Path(args.output_dir) if args.output_dir else Path('pictures')
     output_dir.mkdir(parents=True, exist_ok=True)
-    print(f"Output: {output_dir}  pattern={args.pattern}  "
-          f"stretch={not args.no_stretch}  sat={args.saturation}×")
+    print(f"Output: {output_dir}  sat={args.saturation}×")
 
     try:
         dev = find_camera()
@@ -325,7 +317,6 @@ def main():
 
                 save_png(str(output_dir / f"{safe_name}.png"), data,
                          width=w, height=h, sensor_width=sw,
-                         pattern=args.pattern, stretch=not args.no_stretch,
                          saturation=args.saturation)
 
                 if args.raw:
@@ -336,9 +327,6 @@ def main():
                 import traceback
                 print(f"ERROR: {e}")
                 traceback.print_exc()
-
-        if args.delete:
-            delete_all_pictures(dev)
 
         print(f"\nDone. Files saved to: {output_dir}")
 
