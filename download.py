@@ -143,10 +143,11 @@ def save_png(png_path, raw_data, width=IMG_W, height=IMG_H,
     print(f"  Saved: {png_path}")
 
 
-def save_ppm(ppm_path, raw_data, width=IMG_W, height=IMG_H, sensor_width=None):
+def save_ppm(ppm_path, raw_data, width=IMG_W, height=IMG_H, sensor_width=None,
+             dark_subtract=True):
     """Save extracted Bayer data as a grayscale P5 PPM (no debayering)."""
     sw = sensor_width if sensor_width is not None else width + DARK_COLS
-    pixels = extract_bayer(raw_data, sw, width, height)
+    pixels = extract_bayer(raw_data, sw, width, height, dark_subtract=dark_subtract)
     with open(ppm_path, 'wb') as f:
         f.write(f"P5\n{width} {height}\n255\n".encode())
         f.write(pixels)
@@ -205,11 +206,13 @@ def main():
 
                 save_png(str(output_dir / f"{safe_name}.png"), data,
                          width=w, height=h, sensor_width=sw,
-                         saturation=args.saturation)
+                         saturation=args.saturation, wb_gains=wb_gains,
+                         dark_subtract=dark_subtract)
 
                 if args.raw:
                     save_ppm(str(output_dir / f"{safe_name}.ppm"), data,
-                             width=w, height=h, sensor_width=sw)
+                             width=w, height=h, sensor_width=sw,
+                             dark_subtract=dark_subtract)
 
             except Exception as e:
                 import traceback

@@ -137,9 +137,9 @@ and `CSMaLCameraBaseApi` from SMaL Camera Technologies.
 | Bayer debayering (BGGR)     | ✅ Bilinear interpolation, correct stride=644 |
 | Auto-level stretch          | ✅ Per-channel percentile stretch (1–99 %)    |
 | Companding linearisation    | ❌ Not implemented (t_bp curve unknown)       |
-| Dark-current subtraction    | ❌ Not implemented                            |
-| Colour matrix / white bal.  | ❌ Not implemented                            |
-| XGA (1024×768) support      | ❌ Download loop only reads 10 × 32 KB        |
+| Dark-current subtraction    | ✅ Per-row subtraction using dark ref columns  |
+| Colour matrix / white bal.  | ⚠️  WB gains wired in (--wb R,G,B); no matrix |
+| XGA (1024×768) support      | ✅ Download loop reads until USB timeout       |
 
 ---
 
