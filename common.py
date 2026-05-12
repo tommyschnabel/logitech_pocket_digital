@@ -140,28 +140,16 @@ def find_camera():
 
 
 def init_camera(dev):
-    print(f"Device: {dev}", file=sys.stderr)
     try:
-        cfg = dev.get_active_configuration()
-        print(f"Active config: {cfg.bConfigurationValue}", file=sys.stderr)
-    except Exception as e:
-        print(f"get_active_configuration error: {e}", file=sys.stderr)
-        try:
-            dev.set_configuration()
-            print("set_configuration done", file=sys.stderr)
-        except usb.core.USBError as e:
-            print(f"set_configuration error: {e}", file=sys.stderr)
+        dev.set_configuration()
+    except usb.core.USBError:
+        pass
     try:
         if dev.is_kernel_driver_active(0):
-            print("Kernel driver active, detaching...", file=sys.stderr)
             dev.detach_kernel_driver(0)
-    except (usb.core.USBError, NotImplementedError) as e:
-        print(f"kernel_driver check: {e}", file=sys.stderr)
-    try:
-        usb.util.claim_interface(dev, 0)
-        print("Interface claimed", file=sys.stderr)
-    except Exception as e:
-        print(f"claim_interface error: {e}", file=sys.stderr)
+    except (usb.core.USBError, NotImplementedError):
+        pass
+    usb.util.claim_interface(dev, 0)
     print("Camera initialized.")
     return dev
 
@@ -177,13 +165,7 @@ def release_camera(dev):
 def list_pictures(dev):
     cmd = bytearray(16)
     cmd[0] = CMD_LIST_PICTURES
-    print(f"Sending command: {cmd.hex()}", file=sys.stderr)
-    try:
-        dev.write(EP_OUT, cmd, timeout=1000)
-        print("Command sent, reading response...", file=sys.stderr)
-    except Exception as e:
-        print(f"Write error: {e}", file=sys.stderr)
-        raise
+    dev.write(EP_OUT, cmd, timeout=1000)
     data = (bytes(dev.read(EP_IN, 32768, timeout=5000)) +
             bytes(dev.read(EP_IN, 32768, timeout=5000)))
     num_pics = data[0x105]
