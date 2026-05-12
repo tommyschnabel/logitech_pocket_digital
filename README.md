@@ -42,18 +42,68 @@ On macOS, PyUSB works directly via libusb (`brew install libusb`).
 ## Usage
 
 ```
-python pocket_digital_download.py [output_dir] [options]
+python download.py [output_dir] [options]
+python delete.py  # delete all photos from camera
 ```
 
-By default photos are saved to `~/Pictures/PocketDigital/`.
+By default photos are saved to `pictures/` in the current directory.
 
 | Option | Description |
 |---|---|
 | `--raw` | Also save raw Bayer data as grayscale PPM files |
-| `--delete` | Delete all photos from camera after downloading |
-| `--pattern RGGB` | Bayer CFA pattern (default: RGGB) |
-| `--no-stretch` | Disable global histogram stretching |
 | `--saturation 2.0` | Colour saturation multiplier (default: 2.0) |
+| `--wb R,G,B` | Per-channel white-balance gains (default: 1.0,1.0,1.0) |
+| `--no-dark-subtract` | Disable dark-current subtraction using reference columns |
+
+---
+
+## Android / Termux
+
+The camera can be used on Android via Termux. Android requires explicit user permission
+before apps can access USB devices; the scripts work around this using the
+[termux-usb](https://wiki.termux.com/wiki/Termux-usb) tool from termux-api.
+
+### 1. Install Termux:API
+
+Install **Termux:API** from the same source as Termux (F-Droid or Google Play).
+
+### 2. Install packages inside Termux
+
+```bash
+pkg update
+pkg install termux-api libusb python pyusb Pillow
+```
+
+**Important:** You need libusb ≥ 1.0.29-1 which includes the Termux USB patch
+(`TERMUX_USB_FD` support). Check with `pkg show libusb`.
+
+### 3. Find the camera
+
+```bash
+termux-usb -l
+```
+
+Note the device path (e.g. `/dev/bus/usb/001/002`).
+
+### 4. Run the scripts
+
+You must run the scripts **through** `termux-usb -E` so Android can pass an
+authorized file descriptor to libusb. The `-E` flag sets `TERMUX_USB_FD` which
+the patched libusb reads internally.
+
+**First time** (grants permission — shows a system dialog):
+
+```bash
+termux-usb -r -E -e "./download.py" /dev/bus/usb/001/002
+```
+
+**After permission is granted** (no dialog needed):
+
+```bash
+termux-usb -E -e "./download.py" /dev/bus/usb/001/002
+```
+
+The scripts will print instructions if you run them directly without `termux-usb`.
 
 ---
 
@@ -127,6 +177,7 @@ Full protocol documentation, header field offsets, and known-unknown fields are 
 | Header parsing (dims, gamma, tint, gain) | ✅ |
 | Bayer demosaicking (RGGB, bilinear) | ✅ |
 | Global histogram stretch | ✅ |
+| Android / Termux support | ✅ requires libusb ≥ 1.0.29-1 with `-E` flag |
 | SMaL companding linearisation | ❌ `t_bp[0..6]` breakpoints not yet decoded |
 | Dark-current subtraction | ❌ |
 | Colour matrix | ❌ |

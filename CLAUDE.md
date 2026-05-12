@@ -143,6 +143,41 @@ and `CSMaLCameraBaseApi` from SMaL Camera Technologies.
 
 ---
 
+## Android / Termux Support
+
+The scripts work on Android via Termux using a patched libusb that reads `TERMUX_USB_FD`.
+
+### How It Works
+
+1. `termux-usb -E -e './download.py' /dev/bus/usb/001/002` runs the script with:
+   - `-r` flag: shows Android permission dialog (first time only)
+   - `-E` flag: sets `TERMUX_USB_FD=<fd>` environment variable
+   - The fd is an authorized file descriptor from Android's UsbManager
+
+2. The Termux libusb package (≥1.0.29-1) is patched to:
+   - Detect `TERMUX_USB_FD` environment variable during `libusb_init()`
+   - Read the fd and create an internal device entry
+   - Return that device from `libusb_get_device_list()`
+   - Use `dup(fd)` when `libusb_open()` is called
+
+3. PyUSB/usb.core.find() works normally — the patched libusb handles everything.
+
+### Key Insight
+
+The Termux patch avoids the `libusb_wrap_sys_device` assertion crash by patching
+the Linux usbfs backend directly instead of using the wrap functions. The device
+is created internally with proper refcounting, so `libusb_open()` doesn't assert.
+
+See: https://github.com/termux/termux-packages/pull/21620
+
+### Requirements
+
+- Termux:API app (for termux-usb command)
+- `pkg install termux-api libusb python pyusb Pillow`
+- libusb ≥ 1.0.29-1 (includes the TERMUX_USB_FD patch)
+
+---
+
 ## File Naming Convention
 
 The camera stores files with DOS 8.3 names: `IMGnnnn.EXT` where `EXT` is

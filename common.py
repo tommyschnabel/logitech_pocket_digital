@@ -8,6 +8,8 @@ at stride=sensor_width (dark reference columns are NOT stripped by firmware).
 """
 
 import struct
+import os
+import sys
 import usb.core
 import usb.util
 
@@ -20,11 +22,8 @@ CMD_LIST_PICTURES = 0x12
 CMD_GET_PICTURE   = 0x11
 CMD_DELETE_ALL    = 0x18
 
-IMG_START = 0x29  # pixel data begins 41 bytes into the USB response
+IMG_START = 0x29
 
-# The camera sends pixel rows at stride=sensor_width; dark reference columns
-# are NOT stripped by firmware. Active image = first active_width columns,
-# active_height rows. For VGA captures: sensor 644×482 → active 640×480.
 DARK_COLS = 4
 DARK_ROWS = 2
 
@@ -63,7 +62,77 @@ def parse_header(raw_data):
     }
 
 
+def _is_android():
+    """Check if we're running inside Termux on Android."""
+    if os.environ.get('TERMUX_VERSION') or os.environ.get('TERMUX_API_VERSION'):
+        return True
+    if 'com.termux' in os.environ.get('PREFIX', ''):
+        return True
+    if 'com.termux' in os.environ.get('HOME', ''):
+        return True
+    return os.path.exists('/data/data/com.termux')
+
+
+def _has_termux_usb_fd():
+    """Check if TERMUX_USB_FD is set (from termux-usb -E)."""
+    fd = os.environ.get('TERMUX_USB_FD')
+    return fd is not None and fd.isdigit() and int(fd) >= 0
+
+
+def _termux_list_devices():
+    """Return list of USB device paths from termux-usb -l, or empty list."""
+    import subprocess
+    try:
+        result = subprocess.run(
+            ['termux-usb', '-l'], capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0:
+            import json
+            try:
+                devices = json.loads(result.stdout)
+                if isinstance(devices, list):
+                    return devices
+            except json.JSONDecodeError:
+                pass
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return []
+
+
+def _termux_usage(devices):
+    """Print instructions for running via termux-usb and exit."""
+    me = os.path.basename(sys.argv[0])
+    print("\nAndroid / Termux detected.", file=sys.stderr)
+    print("The script must be run via termux-usb -E so Android grants USB permission.\n", file=sys.stderr)
+    if devices:
+        for path in devices:
+            print(f"  termux-usb -r -E -e './{me}' {path}", file=sys.stderr)
+    else:
+        print("No USB devices found. Make sure the camera is plugged in.", file=sys.stderr)
+        print(f"\n  termux-usb -l                    # list devices", file=sys.stderr)
+        print(f"  termux-usb -r -E -e './{me}' <device_path>", file=sys.stderr)
+    print("\nThe -r flag shows the permission dialog (needed once).", file=sys.stderr)
+    print("The -E flag is required -- it sets TERMUX_USB_FD for the patched libusb.", file=sys.stderr)
+    print("\nAfter permission is granted you can omit -r:", file=sys.stderr)
+    if devices:
+        print(f"  termux-usb -E -e './{me}' {devices[0]}", file=sys.stderr)
+    print("\nRequires: libusb >= 1.0.29-1 (Termux package with termux-usb support)", file=sys.stderr)
+    sys.exit(1)
+
+
 def find_camera():
+    """Find the camera via pyusb; on Android require termux-usb -E."""
+    if _is_android():
+        if _has_termux_usb_fd():
+            dev = usb.core.find(idVendor=VID, idProduct=PID)
+            if dev is None:
+                dev = usb.core.find()
+                if dev is None:
+                    raise RuntimeError("No USB device found via termux-usb.")
+            return dev
+        devices = _termux_list_devices()
+        _termux_usage(devices)
+
     dev = usb.core.find(idVendor=VID, idProduct=PID)
     if dev is None:
         raise RuntimeError("Logitech Pocket Digital camera not found!")
@@ -71,16 +140,28 @@ def find_camera():
 
 
 def init_camera(dev):
+    print(f"Device: {dev}", file=sys.stderr)
     try:
-        dev.set_configuration()
-    except usb.core.USBError:
-        pass
+        cfg = dev.get_active_configuration()
+        print(f"Active config: {cfg.bConfigurationValue}", file=sys.stderr)
+    except Exception as e:
+        print(f"get_active_configuration error: {e}", file=sys.stderr)
+        try:
+            dev.set_configuration()
+            print("set_configuration done", file=sys.stderr)
+        except usb.core.USBError as e:
+            print(f"set_configuration error: {e}", file=sys.stderr)
     try:
         if dev.is_kernel_driver_active(0):
+            print("Kernel driver active, detaching...", file=sys.stderr)
             dev.detach_kernel_driver(0)
-    except usb.core.USBError:
-        pass
-    usb.util.claim_interface(dev, 0)
+    except (usb.core.USBError, NotImplementedError) as e:
+        print(f"kernel_driver check: {e}", file=sys.stderr)
+    try:
+        usb.util.claim_interface(dev, 0)
+        print("Interface claimed", file=sys.stderr)
+    except Exception as e:
+        print(f"claim_interface error: {e}", file=sys.stderr)
     print("Camera initialized.")
     return dev
 
@@ -96,7 +177,13 @@ def release_camera(dev):
 def list_pictures(dev):
     cmd = bytearray(16)
     cmd[0] = CMD_LIST_PICTURES
-    dev.write(EP_OUT, cmd, timeout=1000)
+    print(f"Sending command: {cmd.hex()}", file=sys.stderr)
+    try:
+        dev.write(EP_OUT, cmd, timeout=1000)
+        print("Command sent, reading response...", file=sys.stderr)
+    except Exception as e:
+        print(f"Write error: {e}", file=sys.stderr)
+        raise
     data = (bytes(dev.read(EP_IN, 32768, timeout=5000)) +
             bytes(dev.read(EP_IN, 32768, timeout=5000)))
     num_pics = data[0x105]
@@ -121,7 +208,7 @@ def download_picture(dev, filename):
         cmd[3 + i] = c
     dev.write(EP_OUT, cmd, timeout=1000)
     data = bytearray()
-    for _ in range(10):
+    while True:
         try:
             data.extend(dev.read(EP_IN, 32768, timeout=5000))
         except usb.core.USBError:
@@ -130,7 +217,6 @@ def download_picture(dev, filename):
 
 
 def delete_all_pictures(dev):
-    # Camera requires a list command before it will accept a delete command.
     cmd = bytearray(16)
     cmd[0] = CMD_LIST_PICTURES
     dev.write(EP_OUT, cmd, timeout=1000)

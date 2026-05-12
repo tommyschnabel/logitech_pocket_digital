@@ -29,18 +29,24 @@ PATTERNS = {
 }
 
 
-def extract_bayer(raw_data, sensor_width, active_width, active_height):
-    """Copy the active Bayer pixels out of the raw USB download.
+def extract_bayer(raw_data, sensor_width, active_width, active_height, dark_subtract=True):
+    """Copy active Bayer pixels and optionally subtract per-row dark current.
 
-    Each row in the download is sensor_width bytes wide; the last DARK_COLS
-    bytes are dark reference columns. Builds a compact active_width×active_height
-    buffer by taking only the first active_width bytes of each row.
+    Each row is sensor_width bytes wide; the last (sensor_width - active_width)
+    bytes are dark reference columns. When dark_subtract is True, their average
+    is subtracted from every pixel in that row to remove dark-current bias.
     """
+    num_dark = sensor_width - active_width
     out = bytearray(active_width * active_height)
     for row in range(active_height):
-        src = IMG_START + row * sensor_width
-        dst = row * active_width
-        out[dst:dst + active_width] = raw_data[src:src + active_width]
+        row_start = IMG_START + row * sensor_width
+        row_data = raw_data[row_start:row_start + active_width]
+        if dark_subtract and num_dark > 0:
+            dark = sum(raw_data[row_start + active_width:row_start + sensor_width]) // num_dark
+            if dark > 0:
+                lut = bytes(max(0, v - dark) for v in range(256))
+                row_data = row_data.translate(lut)
+        out[row * active_width:row * active_width + active_width] = row_data
     return bytes(out)
 
 
@@ -124,10 +130,13 @@ def global_stretch(rgb_bytes, lo_pct=2.0, hi_pct=98.0):
 
 
 def save_png(png_path, raw_data, width=IMG_W, height=IMG_H,
-             sensor_width=None, saturation=2.0):
-    """Full pipeline: extract Bayer → debayer → stretch → save PNG."""
+             sensor_width=None, saturation=2.0, wb_gains=(1.0, 1.0, 1.0),
+             dark_subtract=True):
+    """Full pipeline: extract Bayer → [dark subtract] → [WB] → debayer → stretch → save PNG."""
     sw = sensor_width if sensor_width is not None else width + DARK_COLS
-    pixels = extract_bayer(raw_data, sw, width, height)
+    pixels = extract_bayer(raw_data, sw, width, height, dark_subtract=dark_subtract)
+    if wb_gains != (1.0, 1.0, 1.0):
+        pixels = apply_wb(pixels, width, height, wb_gains)
     rgb = global_stretch(debayer_bilinear(pixels, width, height))
     img = ImageEnhance.Color(Image.frombytes('RGB', (width, height), rgb)).enhance(saturation)
     img.save(png_path, 'PNG')
@@ -151,11 +160,18 @@ def main():
                         help='Also save raw Bayer PPM files')
     parser.add_argument('--saturation', type=float, default=2.0,
                         help='Colour saturation multiplier (default: 2.0)')
+    parser.add_argument('--wb', default='1.0,1.0,1.0', metavar='R,G,B',
+                        help='Per-channel white-balance gains (default: 1.0,1.0,1.0)')
+    parser.add_argument('--no-dark-subtract', action='store_true',
+                        help='Disable dark-current subtraction using reference columns')
     args = parser.parse_args()
+
+    wb_gains = tuple(float(v) for v in args.wb.split(','))
+    dark_subtract = not args.no_dark_subtract
 
     output_dir = Path(args.output_dir) if args.output_dir else Path('pictures')
     output_dir.mkdir(parents=True, exist_ok=True)
-    print(f"Output: {output_dir}  sat={args.saturation}×")
+    print(f"Output: {output_dir}  sat={args.saturation}×  wb={wb_gains}  dark_subtract={dark_subtract}")
 
     dev = None
     try:
@@ -197,15 +213,15 @@ def main():
 
             except Exception as e:
                 import traceback
-                print(f"ERROR: {e}")
-                traceback.print_exc()
+                print(f"ERROR: {e}", file=sys.stderr)
+                traceback.print_exc(file=sys.stderr)
 
         print(f"\nDone. Files saved to: {output_dir}")
 
     except Exception as e:
         import traceback
-        print(f"Error: {e}")
-        traceback.print_exc()
+        print(f"Error: {e}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
     finally:
         if dev:
             release_camera(dev)
