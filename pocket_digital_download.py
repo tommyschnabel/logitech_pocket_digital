@@ -1,6 +1,15 @@
 #!/usr/bin/env python3
 """
 Logitech Pocket Digital - Photo Downloader
+Reverse-engineered USB protocol for the SMaL UltraPocket sensor (VID:046D PID:0950).
+
+Raw image format: 41-byte header followed by Bayer pixel data at stride=sensor_width.
+The camera does NOT pre-crop dark reference columns; each row is sensor_width (e.g. 644)
+bytes wide. The active image is the first active_width (e.g. 640) columns of each row.
+
+Bayer pattern: BGGR.
+  Row 0: B G B G ...  (even rows: B at even cols, G at odd cols)
+  Row 1: G R G R ...  (odd rows:  G at even cols, R at odd cols)
 """
 
 import usb.core
@@ -9,6 +18,7 @@ import sys
 from pathlib import Path
 from PIL import Image
 import argparse
+import struct
 
 VID = 0x046D
 PID = 0x0950
@@ -18,6 +28,174 @@ EP_IN = 0x81
 CMD_LIST_PICTURES = 0x12
 CMD_GET_PICTURE = 0x11
 CMD_DELETE_ALL = 0x18
+
+IMG_START = 0x29   # byte offset where pixel data begins in the USB response
+
+# The sensor outputs sensor_width × sensor_height pixels. The camera does NOT
+# pre-crop dark reference columns, so the USB download stride = sensor_width.
+# Active image = first active_width columns of each row, active_height rows.
+DARK_COLS = 4   # sensor_width - active_width (dark reference cols per frame)
+DARK_ROWS = 2   # sensor_height - active_height (dark reference rows per frame)
+
+# Default active image dimensions (derived from the sensor header values).
+IMG_W = 640
+IMG_H = 480
+
+# BGGR tile (row_parity, col_parity) -> channel
+# SMaL UltraPocket sensor layout:
+#   Row 0 (even): B G B G ...
+#   Row 1 (odd):  G R G R ...
+BAYER_BGGR = {(0, 0): 'B', (0, 1): 'G', (1, 0): 'G', (1, 1): 'R'}
+BAYER_GRBG = {(0, 0): 'G', (0, 1): 'R', (1, 0): 'B', (1, 1): 'G'}
+BAYER_RGGB = {(0, 0): 'R', (0, 1): 'G', (1, 0): 'G', (1, 1): 'B'}
+BAYER_GBRG = {(0, 0): 'G', (0, 1): 'B', (1, 0): 'R', (1, 1): 'G'}
+
+PATTERNS = {
+    'BGGR': BAYER_BGGR,
+    'GRBG': BAYER_GRBG,
+    'RGGB': BAYER_RGGB,
+    'GBRG': BAYER_GBRG,
+}
+
+
+def parse_header(raw_data):
+    """
+    Decode the 41-byte (0x29) camera response header.
+
+    Confirmed layout (little-endian):
+      0x00       magic byte  (0xFF)
+      0x0C-0x0D  sensor_height  (e.g. 482 = active_h + DARK_ROWS)
+      0x0E-0x0F  sensor_width   (e.g. 644 = active_w + DARK_COLS)
+      0x10-0x11  img_start      (always 0x29 = 41)
+      0x22       gammaCode      (0-7, SMaL companding curve selector)
+      0x23       tint           (white-balance tint code)
+      0x24       gain_shift     (log2 of sensor gain; 0=1×, 1=2×, 2=4×, …)
+
+    Derived:
+      active_width  = sensor_width  - DARK_COLS  (e.g. 640)
+      active_height = sensor_height - DARK_ROWS  (e.g. 480)
+    Download stride = sensor_width (dark columns are NOT stripped by firmware).
+    Active image = first active_width columns × active_height rows.
+    """
+    if len(raw_data) < IMG_START:
+        return {}
+    h = raw_data[:IMG_START]
+    sensor_h = struct.unpack_from('<H', h, 0x0C)[0]
+    sensor_w = struct.unpack_from('<H', h, 0x0E)[0]
+    active_w = sensor_w - DARK_COLS
+    active_h = sensor_h - DARK_ROWS
+    return {
+        'sensor_width':  sensor_w,
+        'sensor_height': sensor_h,
+        'active_width':  active_w,
+        'active_height': active_h,
+        'img_start':     struct.unpack_from('<H', h, 0x10)[0],
+        'gamma_code':    h[0x22],
+        'tint':          h[0x23],
+        'gain_shift':    h[0x24],
+    }
+
+
+def extract_bayer(raw_data, sensor_width, active_width, active_height):
+    """
+    Extract the active Bayer pixels from the raw USB download.
+
+    The camera sends pixel rows at stride=sensor_width (dark cols not stripped).
+    This copies the first active_width columns from each of active_height rows
+    into a compact active_width×active_height buffer.
+    """
+    out = bytearray(active_width * active_height)
+    for row in range(active_height):
+        src = IMG_START + row * sensor_width
+        dst = row * active_width
+        out[dst:dst + active_width] = raw_data[src:src + active_width]
+    return bytes(out)
+
+
+def debayer_bilinear(pixels, width=IMG_W, height=IMG_H, pattern='BGGR'):
+    """
+    Bilinear Bayer demosaicking.
+
+    pixels: compact width*height Bayer bytes (output of extract_bayer).
+    Each channel is directly measured at its native positions and bilinearly
+    interpolated at all other positions from the nearest same-color neighbors.
+    """
+    tile = PATTERNS[pattern]
+
+    def get(y, x):
+        if 0 <= y < height and 0 <= x < width:
+            return pixels[y * width + x]
+        return None
+
+    def avg(*vals):
+        v = [x for x in vals if x is not None]
+        return sum(v) // len(v) if v else 0
+
+    rgb = bytearray(width * height * 3)
+
+    for y in range(height):
+        for x in range(width):
+            ch = tile[(y % 2, x % 2)]
+            p = pixels[y * width + x]
+
+            if ch == 'G':
+                G = p
+                # Determine which axis has R and which has B based on tile neighbors
+                if tile[(y % 2, (x + 1) % 2)] == 'R':
+                    # Even row G: left/right are R, above/below are B
+                    R = avg(get(y, x - 1), get(y, x + 1))
+                    B = avg(get(y - 1, x), get(y + 1, x))
+                else:
+                    # Odd row G: above/below are R, left/right are B
+                    R = avg(get(y - 1, x), get(y + 1, x))
+                    B = avg(get(y, x - 1), get(y, x + 1))
+
+            elif ch == 'R':
+                R = p
+                G = avg(get(y, x - 1), get(y, x + 1),
+                        get(y - 1, x),  get(y + 1, x))
+                B = avg(get(y - 1, x - 1), get(y - 1, x + 1),
+                        get(y + 1, x - 1), get(y + 1, x + 1))
+
+            else:  # 'B'
+                B = p
+                G = avg(get(y, x - 1), get(y, x + 1),
+                        get(y - 1, x),  get(y + 1, x))
+                R = avg(get(y - 1, x - 1), get(y - 1, x + 1),
+                        get(y + 1, x - 1), get(y + 1, x + 1))
+
+            i = (y * width + x) * 3
+            rgb[i] = R
+            rgb[i + 1] = G
+            rgb[i + 2] = B
+
+    return bytes(rgb)
+
+
+def auto_levels(rgb_bytes, width, height, lo_pct=1.0, hi_pct=99.0):
+    """
+    Linear histogram stretch.
+
+    Clips to the lo/hi percentile then scales to full 0-255 range.
+    Handles each channel independently so white balance is preserved.
+    """
+    import math
+
+    n = width * height
+    result = bytearray(len(rgb_bytes))
+
+    for ch in range(3):
+        vals = sorted(rgb_bytes[ch::3])
+        lo = vals[max(0, int(n * lo_pct / 100))]
+        hi = vals[min(n - 1, int(n * hi_pct / 100))]
+        span = hi - lo
+        if span == 0:
+            span = 1
+        for i in range(n):
+            v = rgb_bytes[i * 3 + ch]
+            result[i * 3 + ch] = min(255, max(0, int((v - lo) * 255 / span)))
+
+    return bytes(result)
 
 
 def find_camera():
@@ -94,106 +272,49 @@ def delete_all_pictures(dev):
     print("All pictures deleted from camera.")
 
 
-def debayer_simple(raw_data, width=640, height=480):
-    """Simple debayer for BGGR Bayer pattern - outputs RGB.
-    BGGR 2x2:
-    B G
-    G R
-    """
-    IMG_START = 0x29
-
-    # Create output RGB image
-    rgb_data = bytearray(width * height * 3)
-
-    for y in range(height):
-        for x in range(width):
-            src_idx = IMG_START + y * width + x
-            if src_idx >= len(raw_data):
-                # Out of bounds
-                rgb_idx = (y * width + x) * 3
-                rgb_data[rgb_idx] = 0
-                rgb_data[rgb_idx + 1] = 0
-                rgb_data[rgb_idx + 2] = 0
-                continue
-
-            pixel = raw_data[src_idx]
-
-            # Determine position in Bayer pattern
-            # BGGR: (0,0)=B, (0,1)=G, (1,0)=G, (1,1)=R
-            is_even_row = (y % 2 == 0)
-            is_even_col = (x % 2 == 0)
-
-            rgb_idx = (y * width + x) * 3
-
-            if is_even_row and is_even_col:
-                # B pixel
-                b = pixel
-                # G from neighbors
-                g = pixel  # fallback
-                r = pixel  # fallback
-                # Simple interpolation
-                neighbors = []
-                if y > 0: neighbors.append(raw_data[src_idx - width])
-                if y < height - 1: neighbors.append(raw_data[src_idx + width])
-                if x > 0: neighbors.append(raw_data[src_idx - 1])
-                if x < width - 1: neighbors.append(raw_data[src_idx + 1])
-                if neighbors:
-                    g = sum(neighbors) // len(neighbors)
-                r = pixel  # R at B position needs interpolation
-
-            elif is_even_row and not is_even_col:
-                # G pixel (top row of 2x2)
-                g = pixel
-                b = pixel
-                r = pixel
-
-            elif not is_even_row and is_even_col:
-                # G pixel (bottom row of 2x2)
-                g = pixel
-                b = pixel
-                r = pixel
-
-            else:
-                # R pixel
-                r = pixel
-                b = pixel
-                g = pixel
-
-            rgb_data[rgb_idx] = r
-            rgb_data[rgb_idx + 1] = g
-            rgb_data[rgb_idx + 2] = b
-
-    return bytes(rgb_data)
-
-
-def save_png_debayered(png_path, raw_data, width=640, height=480):
-    """Debayer raw Bayer data and save as PNG."""
-    rgb = debayer_simple(raw_data, width, height)
+def save_png(png_path, raw_data, width=IMG_W, height=IMG_H,
+             sensor_width=None, pattern='BGGR', stretch=True):
+    """Debayer and save as PNG, optionally with auto-level stretching."""
+    sw = sensor_width if sensor_width is not None else width + DARK_COLS
+    pixels = extract_bayer(raw_data, sw, width, height)
+    rgb = debayer_bilinear(pixels, width, height, pattern)
+    if stretch:
+        rgb = auto_levels(rgb, width, height)
     img = Image.frombytes('RGB', (width, height), rgb)
     img.save(png_path, 'PNG')
     print(f"  Saved: {png_path}")
 
 
-def save_ppm(ppm_path, raw_data, width=640, height=480):
-    """Save raw Bayer data as PPM (grayscale)."""
-    IMG_START = 0x29
+def save_ppm(ppm_path, raw_data, width=IMG_W, height=IMG_H, sensor_width=None):
+    """Save raw Bayer data as grayscale PPM (no debayering)."""
+    sw = sensor_width if sensor_width is not None else width + DARK_COLS
+    pixels = extract_bayer(raw_data, sw, width, height)
     with open(ppm_path, 'wb') as f:
-        header = f"P5\n{width} {height}\n255\n".encode()
-        f.write(header)
-        f.write(raw_data[IMG_START:IMG_START + width * height])
+        f.write(f"P5\n{width} {height}\n255\n".encode())
+        f.write(pixels)
     print(f"  Saved: {ppm_path}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Download photos from Logitech Pocket Digital')
+    parser = argparse.ArgumentParser(
+        description='Download photos from Logitech Pocket Digital')
     parser.add_argument('output_dir', nargs='?', default=None)
-    parser.add_argument('--raw', action='store_true', help='Also save raw PPM files')
-    parser.add_argument('--delete', action='store_true', help='Delete photos after downloading')
+    parser.add_argument('--raw', action='store_true',
+                        help='Also save raw Bayer PPM files')
+    parser.add_argument('--delete', action='store_true',
+                        help='Delete photos from camera after downloading')
+    parser.add_argument('--pattern', default='BGGR',
+                        choices=list(PATTERNS.keys()),
+                        help='Bayer CFA pattern (default: BGGR)')
+    parser.add_argument('--no-stretch', action='store_true',
+                        help='Disable auto-level histogram stretching')
     args = parser.parse_args()
 
-    output_dir = Path(args.output_dir) if args.output_dir else Path.home() / "Pictures" / "PocketDigital"
+    output_dir = (Path(args.output_dir) if args.output_dir
+                  else Path.home() / "Pictures" / "PocketDigital")
     output_dir.mkdir(parents=True, exist_ok=True)
     print(f"Output directory: {output_dir}")
+    print(f"Bayer pattern: {args.pattern}  Auto-stretch: {not args.no_stretch}")
 
     try:
         print("Searching for camera...")
@@ -205,7 +326,7 @@ def main():
             print("No pictures found.")
             return
 
-        print(f"\nDownloading {len(pictures)} pictures...")
+        print(f"\nDownloading {len(pictures)} picture(s)...")
 
         for i, pic in enumerate(pictures):
             safe_name = pic.replace(' ', '_').replace('/', '_')
@@ -214,14 +335,30 @@ def main():
 
             try:
                 data = download_picture(dev, pic)
-                if len(data) > 0x29:
-                    png_path = output_dir / f"{safe_name}.png"
-                    save_png_debayered(str(png_path), data)
-                    if args.raw:
-                        ppm_path = output_dir / f"{safe_name}.ppm"
-                        save_ppm(str(ppm_path), data)
-                else:
+                if len(data) <= IMG_START:
                     print(f"ERROR: Too little data ({len(data)} bytes)")
+                    continue
+
+                meta = parse_header(data)
+                w = meta.get('active_width', IMG_W)
+                h = meta.get('active_height', IMG_H)
+                sw = meta.get('sensor_width', w + DARK_COLS)
+                if meta:
+                    print(f"(sensor {meta['sensor_width']}x{meta['sensor_height']} "
+                          f"-> {w}x{h} "
+                          f"gamma={meta['gamma_code']} tint={meta['tint']} "
+                          f"gain={2**meta['gain_shift']}x)", end=" ")
+
+                png_path = output_dir / f"{safe_name}.png"
+                save_png(str(png_path), data, width=w, height=h,
+                         sensor_width=sw, pattern=args.pattern,
+                         stretch=not args.no_stretch)
+
+                if args.raw:
+                    ppm_path = output_dir / f"{safe_name}.ppm"
+                    save_ppm(str(ppm_path), data, width=w, height=h,
+                             sensor_width=sw)
+
             except Exception as e:
                 import traceback
                 print(f"ERROR: {e}")
@@ -242,7 +379,7 @@ def main():
         try:
             usb.util.release_interface(dev, 0)
             usb.util.dispose_resources(dev)
-        except:
+        except Exception:
             pass
 
 
