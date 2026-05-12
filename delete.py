@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """Delete all photos from the Logitech Pocket Digital camera."""
 
-import usb.util
-from pocket_digital_download import find_camera, init_camera, delete_all_pictures
+from common import find_camera, init_camera, release_camera, delete_all_pictures
 
 dev = find_camera()
 init_camera(dev)
@@ -11,5 +10,4 @@ if answer.strip().lower() == 'y':
     delete_all_pictures(dev)
 else:
     print("Aborted.")
-usb.util.release_interface(dev, 0)
-usb.util.dispose_resources(dev)
+release_camera(dev)
