@@ -10,6 +10,8 @@ at stride=sensor_width (dark reference columns are NOT stripped by firmware).
 import struct
 import os
 import sys
+import threading
+import time
 import usb.core
 import usb.util
 
@@ -29,6 +31,16 @@ DARK_ROWS = 2
 
 IMG_W = 640
 IMG_H = 480
+
+
+def start_periodic_stdout_flush(interval=1.0):
+    """Start a daemon thread that flushes sys.stdout every *interval* seconds."""
+    def loop():
+        while True:
+            time.sleep(interval)
+            sys.stdout.flush()
+    t = threading.Thread(target=loop, daemon=True)
+    t.start()
 
 
 def parse_header(raw_data):

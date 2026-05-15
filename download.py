@@ -18,6 +18,7 @@ from common import (
     find_camera, init_camera, release_camera,
     list_pictures, download_picture, parse_header,
     IMG_START, DARK_COLS, IMG_W, IMG_H,
+    start_periodic_stdout_flush
 )
 
 # (row_parity, col_parity) → channel
@@ -152,23 +153,10 @@ def save_ppm(ppm_path, raw_data, width=IMG_W, height=IMG_H, sensor_width=None,
         f.write(f"P5\n{width} {height}\n255\n".encode())
         f.write(pixels)
     print(f"  Saved: {ppm_path}")
-
+    
 
 def main():
-    parser = argparse.ArgumentParser(description='Download photos from Logitech Pocket Digital')
-    parser.add_argument('output_dir', nargs='?', default=None)
-    parser.add_argument('--raw', action='store_true',
-                        help='Also save raw Bayer PPM files')
-    parser.add_argument('--saturation', type=float, default=2.0,
-                        help='Colour saturation multiplier (default: 2.0)')
-    parser.add_argument('--wb', default='1.0,1.0,1.0', metavar='R,G,B',
-                        help='Per-channel white-balance gains (default: 1.0,1.0,1.0)')
-    parser.add_argument('--no-dark-subtract', action='store_true',
-                        help='Disable dark-current subtraction using reference columns')
-    args = parser.parse_args()
-
-    wb_gains = tuple(float(v) for v in args.wb.split(','))
-    dark_subtract = not args.no_dark_subtract
+    start_periodic_stdout_flush(1.0)
 
     output_dir = Path(args.output_dir) if args.output_dir else Path('pictures')
     output_dir.mkdir(parents=True, exist_ok=True)
