@@ -13,6 +13,7 @@ import sys
 import argparse
 from pathlib import Path
 from PIL import Image, ImageEnhance
+from datetime import datetime
 
 from common import (
     find_camera, init_camera, release_camera,
@@ -172,6 +173,7 @@ def main():
             print("No pictures found.")
             return
 
+        timestamp_suffix = datetime.now().strftime("_%Y%m%dT%H")
         print(f"Downloading {len(pictures)} picture(s)...")
         for i, pic in enumerate(pictures):
             safe_name = pic.replace(' ', '_').replace('/', '_')
@@ -192,13 +194,13 @@ def main():
                       f"gamma={meta['gamma_code']}  tint={meta['tint']}  "
                       f"gain={2**meta['gain_shift']}×)", end=" ")
 
-                save_png(str(output_dir / f"{safe_name}.png"), data,
+                save_png(str(output_dir / f"{safe_name}{timestamp_suffix}.png"), data,
                          width=w, height=h, sensor_width=sw,
                          saturation=args.saturation, wb_gains=wb_gains,
                          dark_subtract=dark_subtract)
 
                 if args.raw:
-                    save_ppm(str(output_dir / f"{safe_name}.ppm"), data,
+                    save_ppm(str(output_dir / f"{safe_name}{timestamp_suffix}.ppm"), data,
                              width=w, height=h, sensor_width=sw,
                              dark_subtract=dark_subtract)
 
