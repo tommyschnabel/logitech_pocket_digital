@@ -157,9 +157,20 @@ def save_ppm(ppm_path, raw_data, width=IMG_W, height=IMG_H, sensor_width=None,
     
 
 def main():
+    parser = argparse.ArgumentParser(description='Download and process photos from the Logitech Pocket Digital.')
+    parser.add_argument('-o', '--output-dir', default='pictures', help='Output directory (default: pictures)')
+    parser.add_argument('-s', '--saturation', type=float, default=2.0, help='Saturation multiplier (default: 2.0)')
+    parser.add_argument('--wb', type=float, nargs=3, default=(1.0, 1.0, 1.0), metavar=('R','G','B'), help='White balance gains (default: 1.0 1.0 1.0)')
+    parser.add_argument('--no-dark-subtract', action='store_true', help='Disable dark column subtraction')
+    parser.add_argument('--raw', action='store_true', help='Also save raw Bayer PPM files')
+    args = parser.parse_args()
+
+    wb_gains = tuple(args.wb)
+    dark_subtract = not args.no_dark_subtract
+
     start_periodic_stdout_flush(1.0)
 
-    output_dir = Path(args.output_dir) if args.output_dir else Path('pictures')
+    output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     print(f"Output: {output_dir}  sat={args.saturation}×  wb={wb_gains}  dark_subtract={dark_subtract}")
 
