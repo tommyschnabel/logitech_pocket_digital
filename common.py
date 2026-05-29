@@ -9,6 +9,7 @@ at stride=sensor_width (dark reference columns are NOT stripped by firmware).
 
 import struct
 import os
+import shlex
 import sys
 import threading
 import time
@@ -111,41 +112,24 @@ def _termux_list_devices():
     return []
 
 
-def _termux_usage(devices):
-    """Print instructions for running via termux-usb and exit."""
-    me = os.path.basename(sys.argv[0])
-    print("\nAndroid / Termux detected.", file=sys.stderr)
-    print("The script must be run via termux-usb -E so Android grants USB permission.\n", file=sys.stderr)
-    if devices:
-        for path in devices:
-            print(f"  termux-usb -r -E -e './{me}' {path}", file=sys.stderr)
-    else:
-        print("No USB devices found. Make sure the camera is plugged in.", file=sys.stderr)
-        print(f"\n  termux-usb -l                    # list devices", file=sys.stderr)
-        print(f"  termux-usb -r -E -e './{me}' <device_path>", file=sys.stderr)
-    print("\nThe -r flag shows the permission dialog (needed once).", file=sys.stderr)
-    print("The -E flag is required -- it sets TERMUX_USB_FD for the patched libusb.", file=sys.stderr)
-    print("\nAfter permission is granted you can omit -r:", file=sys.stderr)
-    if devices:
-        print(f"  termux-usb -E -e './{me}' {devices[0]}", file=sys.stderr)
-    print("\nRequires: libusb >= 1.0.29-1 (Termux package with termux-usb support)", file=sys.stderr)
-    sys.exit(1)
+def _termux_reexec(devices):
+    """Re-exec this script under termux-usb to obtain USB access."""
+    if not devices:
+        print("No USB devices found — plug in the camera.", file=sys.stderr)
+        sys.exit(1)
+    cmd = shlex.join([sys.executable, os.path.abspath(sys.argv[0])] + sys.argv[1:])
+    os.execvp('termux-usb', ['termux-usb', '-r', '-E', '-e', cmd, devices[0]])
 
 
 def find_camera():
-    """Find the camera via pyusb; on Android require termux-usb -E."""
-    if _is_android():
-        if _has_termux_usb_fd():
-            dev = usb.core.find(idVendor=VID, idProduct=PID)
-            if dev is None:
-                dev = usb.core.find()
-                if dev is None:
-                    raise RuntimeError("No USB device found via termux-usb.")
-            return dev
-        devices = _termux_list_devices()
-        _termux_usage(devices)
+    """Find the camera. On Android, re-execs via termux-usb automatically if needed."""
+    if _is_android() and not _has_termux_usb_fd():
+        _termux_reexec(_termux_list_devices())
 
     dev = usb.core.find(idVendor=VID, idProduct=PID)
+    if dev is None and _has_termux_usb_fd():
+        # Termux libusb may not filter by VID/PID; try first available device
+        dev = usb.core.find()
     if dev is None:
         raise RuntimeError("Logitech Pocket Digital camera not found!")
     return dev
