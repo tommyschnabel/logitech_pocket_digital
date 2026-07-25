@@ -10,6 +10,8 @@ Processing pipeline: extract Bayer → bilinear debayer → global stretch → s
 """
 
 import sys
+import io
+import hashlib
 import argparse
 from pathlib import Path
 from PIL import Image, ImageEnhance
@@ -131,17 +133,43 @@ def global_stretch(rgb_bytes, lo_pct=2.0, hi_pct=98.0):
     return bytes(min(255, max(0, int((v - lo) * 255 / span))) for v in rgb_bytes)
 
 
+def hash_existing_dir(directory):
+    """Return a set of SHA-256 hex digests of every file in `directory`."""
+    hashes = set()
+    for p in Path(directory).iterdir():
+        if p.is_file():
+            hashes.add(hashlib.sha256(p.read_bytes()).hexdigest())
+    return hashes
+
+
 def save_png(png_path, raw_data, width=IMG_W, height=IMG_H,
              sensor_width=None, saturation=2.0, wb_gains=(1.0, 1.0, 1.0),
-             dark_subtract=True):
-    """Full pipeline: extract Bayer → [dark subtract] → [WB] → debayer → stretch → save PNG."""
+             dark_subtract=True, existing_hashes=None):
+    """Full pipeline: extract Bayer → [dark subtract] → [WB] → debayer → stretch → save PNG.
+
+    If `existing_hashes` is provided, the rendered PNG is hashed and skipped
+    when an identical file already exists; the set is updated with new hashes.
+    """
     sw = sensor_width if sensor_width is not None else width + DARK_COLS
     pixels = extract_bayer(raw_data, sw, width, height, dark_subtract=dark_subtract)
     if wb_gains != (1.0, 1.0, 1.0):
         pixels = apply_wb(pixels, width, height, wb_gains)
     rgb = global_stretch(debayer_bilinear(pixels, width, height))
     img = ImageEnhance.Color(Image.frombytes('RGB', (width, height), rgb)).enhance(saturation)
-    img.save(png_path, 'PNG')
+
+    buf = io.BytesIO()
+    img.save(buf, 'PNG')
+    png_bytes = buf.getvalue()
+
+    if existing_hashes is not None:
+        digest = hashlib.sha256(png_bytes).hexdigest()
+        if digest in existing_hashes:
+            print(f"  Skipped (duplicate of existing file): {png_path}")
+            return
+        existing_hashes.add(digest)
+
+    with open(png_path, 'wb') as f:
+        f.write(png_bytes)
     print(f"  Saved: {png_path}")
 
 
@@ -184,6 +212,7 @@ def main():
             print("No pictures found.")
             return
 
+        existing_hashes = hash_existing_dir(output_dir)
         timestamp_suffix = datetime.now().strftime("_%Y%m%dT%H")
         print(f"Downloading {len(pictures)} picture(s)...")
         for i, pic in enumerate(pictures):
@@ -208,7 +237,7 @@ def main():
                 save_png(str(output_dir / f"{safe_name}{timestamp_suffix}.png"), data,
                          width=w, height=h, sensor_width=sw,
                          saturation=args.saturation, wb_gains=wb_gains,
-                         dark_subtract=dark_subtract)
+                         dark_subtract=dark_subtract, existing_hashes=existing_hashes)
 
                 if args.raw:
                     save_ppm(str(output_dir / f"{safe_name}{timestamp_suffix}.ppm"), data,
